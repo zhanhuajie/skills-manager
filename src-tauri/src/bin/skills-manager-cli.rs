@@ -4371,6 +4371,47 @@ mod tests {
         assert!(fs::symlink_metadata(&target).unwrap().is_dir());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn switching_sync_mode_from_junction_converts_to_copy() {
+        let tmp = tempdir().unwrap();
+        let (store, target_root) = sync_mode_fixture(tmp.path(), "junction");
+        run_skill_deployment(
+            &store,
+            &["demo".to_string()],
+            &["test_agent".to_string()],
+            true,
+            false,
+        )
+        .unwrap();
+        let target = target_root.join("demo");
+        assert!(junction::exists(&target).unwrap());
+        assert_eq!(recorded_mode(&store), "junction");
+        assert_eq!(
+            scenario_service::resync_targets_to_sync_mode(&store).unwrap(),
+            0,
+            "nothing is off the current mode"
+        );
+
+        store.set_setting("sync_mode", "copy").unwrap();
+        assert_eq!(
+            scenario_service::resync_targets_to_sync_mode(&store).unwrap(),
+            1
+        );
+        assert!(!junction::exists(&target).unwrap_or(false));
+        assert!(!fs::symlink_metadata(&target).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(&target).unwrap().is_dir());
+        assert!(target.join("SKILL.md").is_file());
+        assert_eq!(recorded_mode(&store), "copy");
+
+        store.set_setting("sync_mode", "junction").unwrap();
+        assert_eq!(
+            scenario_service::resync_targets_to_sync_mode(&store).unwrap(),
+            0
+        );
+        assert!(fs::symlink_metadata(&target).unwrap().is_dir());
+    }
+
     #[test]
     fn skill_and_preset_deployment_round_trip() {
         let tmp = tempdir().unwrap();

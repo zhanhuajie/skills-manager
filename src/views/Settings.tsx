@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useMemo } from "react";
 import {
   Folder,
   FolderOpen,
+  FolderSymlink,
   RefreshCw,
   Link as LinkIcon,
   Unlink,
@@ -1490,6 +1491,16 @@ export function Settings() {
                   )}
                 >
                   <LinkIcon className="w-3 h-3" /> {t("settings.symlink")}
+                </button>
+                <button
+                  onClick={() => handleSyncModeChange("junction")}
+                  disabled={savingSyncMode}
+                  className={cn(
+                    segmentedButtonClass,
+                    syncMode === "junction" ? "bg-surface-active text-secondary" : "text-muted hover:text-tertiary"
+                  )}
+                >
+                  <FolderSymlink className="w-3 h-3" /> {t("settings.junction")}
                 </button>
                 <button
                   onClick={() => handleSyncModeChange("copy")}

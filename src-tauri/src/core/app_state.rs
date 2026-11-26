@@ -300,7 +300,7 @@ fn repoint_after_move(store: &SkillStore, from: &Path, to: &Path) -> Result<usiz
     let mut links: Vec<PathBuf> = store
         .get_all_targets()?
         .into_iter()
-        .filter(|target| target.mode == "symlink")
+        .filter(|target| sync_engine::SyncMode::is_link(&target.mode))
         .map(|target| PathBuf::from(target.target_path))
         .collect();
     let adapters = tool_adapters::all_tool_adapters(store);
@@ -378,11 +378,18 @@ fn repoint_after_move(store: &SkillStore, from: &Path, to: &Path) -> Result<usiz
                 continue;
             }
         };
+        let link_mode = if sync_engine::is_junction(&link) {
+            sync_engine::SyncMode::Junction
+        } else {
+            sync_engine::SyncMode::Symlink
+        };
         if let Err(err) = sync_engine::sync_skill(
             &moved,
             &link,
-            sync_engine::SyncMode::Symlink,
-            sync_engine::ReplacePolicy::Recorded { mode: "symlink" },
+            link_mode,
+            sync_engine::ReplacePolicy::Recorded {
+                mode: link_mode.as_str(),
+            },
         ) {
             failures += 1;
             central_repo::record_startup_error(format!(

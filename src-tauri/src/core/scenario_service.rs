@@ -151,21 +151,40 @@ pub fn preview_scenario_sync(
 /// mode and the skip path must be refused.
 ///
 /// Returns `Some(existing)` when both modes match exactly. Also returns
-/// `Some(Copy)` when the existing record is `"copy"` but the desired
-/// mode is `Symlink` — this is the Windows fallback case (issue #153):
-/// `symlink_dir()` failed on a prior run and we landed in copy mode, so
-/// every subsequent startup would re-attempt symlink, fail again, and
-/// trigger a full recursive copy. Treating the existing copy as
-/// compatible lets the hash gate skip when the source hasn't changed.
+/// `Some(existing)` for downward fallback compatibility:
+/// - `"junction"` satisfies `Symlink` (when `symlink_dir()` lacked privileges
+///   on Windows and fell back to a directory junction).
+/// - `"copy"` satisfies `Symlink` and `Junction` (the fallback case, issue
+///   #153, where link creation failed and we landed in copy mode, so every
+///   subsequent startup won't re-attempt links and trigger a full recopy).
+/// - On Unix, `"symlink"` satisfies `Junction` because directory junctions are
+///   Windows-only and `SyncMode::Junction` creates a symlink there. On Windows,
+///   symlinks and junctions are distinct, so switching from Symlink to Junction
+///   returns `None` to convert existing symlinks into junctions.
 ///
-/// The reverse direction (existing `"symlink"`, desired `Copy`) returns
-/// `None` because the user actively changed the `sync_mode` setting and
-/// the on-disk symlink doesn't reflect that intent.
+/// Switching to `Copy` from `"symlink"` or `"junction"` returns `None` because
+/// the user actively changed the `sync_mode` setting and the on-disk link
+/// doesn't reflect that intent.
 fn skip_check_mode(existing_mode: &str, desired: sync_engine::SyncMode) -> Option<sync_engine::SyncMode> {
+    skip_check_mode_on(existing_mode, desired, cfg!(windows))
+}
+
+fn skip_check_mode_on(
+    existing_mode: &str,
+    desired: sync_engine::SyncMode,
+    windows: bool,
+) -> Option<sync_engine::SyncMode> {
     match (existing_mode, desired) {
         ("symlink", sync_engine::SyncMode::Symlink) => Some(sync_engine::SyncMode::Symlink),
+        ("junction", sync_engine::SyncMode::Junction) => Some(sync_engine::SyncMode::Junction),
         ("copy", sync_engine::SyncMode::Copy) => Some(sync_engine::SyncMode::Copy),
-        ("copy", sync_engine::SyncMode::Symlink) => Some(sync_engine::SyncMode::Copy),
+        ("junction", sync_engine::SyncMode::Symlink) => Some(sync_engine::SyncMode::Junction),
+        ("copy", sync_engine::SyncMode::Symlink | sync_engine::SyncMode::Junction) => {
+            Some(sync_engine::SyncMode::Copy)
+        }
+        ("symlink", sync_engine::SyncMode::Junction) if !windows => {
+            Some(sync_engine::SyncMode::Symlink)
+        }
         _ => None,
     }
 }
@@ -733,13 +752,18 @@ pub fn sync_desired_targets(
                 // an earlier symlink_dir() failed (issue #153). Helpful
                 // when a user later enables Developer Mode and wonders
                 // why Symlink isn't being re-attempted.
-                if existing.mode == "copy" && matches!(desired.mode, sync_engine::SyncMode::Symlink)
+                if existing.mode == "copy"
+                    && matches!(
+                        desired.mode,
+                        sync_engine::SyncMode::Symlink | sync_engine::SyncMode::Junction
+                    )
                 {
                     log::debug!(
-                        "sync_desired_targets: skill {} ({}) staying on copy fallback for {} (content unchanged); undeploy and deploy the skill again to retry symlink",
+                        "sync_desired_targets: skill {} ({}) staying on copy fallback for {} (content unchanged); undeploy and deploy the skill again to retry {}",
                         desired.skill_id,
                         desired.skill_name,
-                        desired.tool
+                        desired.tool,
+                        desired.mode.as_str()
                     );
                 }
                 skipped_count += 1;
@@ -2354,7 +2378,7 @@ mod sync_desired_targets_tests {
 
 #[cfg(test)]
 mod skip_check_mode_tests {
-    use super::skip_check_mode;
+    use super::{skip_check_mode, skip_check_mode_on};
     use super::sync_engine::SyncMode;
 
     #[test]
@@ -2364,33 +2388,66 @@ mod skip_check_mode_tests {
             Some(SyncMode::Symlink)
         ));
         assert!(matches!(
+            skip_check_mode("junction", SyncMode::Junction),
+            Some(SyncMode::Junction)
+        ));
+        assert!(matches!(
             skip_check_mode("copy", SyncMode::Copy),
             Some(SyncMode::Copy)
         ));
     }
 
     #[test]
-    fn copy_existing_with_symlink_desired_treated_as_copy() {
-        // Windows fallback case (issue #153): record says copy because
-        // symlink_dir failed previously. We accept that and let the hash
-        // gate decide freshness, instead of re-attempting symlink and
-        // triggering a full recopy on every startup.
+    fn copy_existing_with_link_desired_treated_as_copy() {
+        // Fallback case (issue #153): record says copy because link creation
+        // failed previously. We accept that and let the hash gate decide
+        // freshness, instead of re-attempting links and triggering a full
+        // recopy on every startup.
         assert!(matches!(
             skip_check_mode("copy", SyncMode::Symlink),
+            Some(SyncMode::Copy)
+        ));
+        assert!(matches!(
+            skip_check_mode("copy", SyncMode::Junction),
             Some(SyncMode::Copy)
         ));
     }
 
     #[test]
-    fn symlink_existing_with_copy_desired_is_incompatible() {
-        // User flipped sync_mode setting from symlink to copy — the
-        // on-disk symlink no longer reflects intent, must resync.
+    fn junction_existing_with_symlink_desired_treated_as_junction() {
+        // Windows fallback case: symlink_dir failed without Developer Mode
+        // and fell back to a directory junction.
+        assert!(matches!(
+            skip_check_mode("junction", SyncMode::Symlink),
+            Some(SyncMode::Junction)
+        ));
+    }
+
+    #[test]
+    fn symlink_existing_with_junction_desired_depends_on_platform() {
+        // On Windows, symlinks and junctions are distinct link types, so
+        // switching from symlink to junction must rewrite the link.
+        assert!(skip_check_mode_on("symlink", SyncMode::Junction, true).is_none());
+        // On Unix, Junction falls back to Symlink, so an existing symlink
+        // already satisfies it.
+        assert!(matches!(
+            skip_check_mode_on("symlink", SyncMode::Junction, false),
+            Some(SyncMode::Symlink)
+        ));
+    }
+
+    #[test]
+    fn link_existing_with_copy_desired_is_incompatible() {
+        // User flipped sync_mode setting from symlink or junction to copy —
+        // the on-disk link no longer reflects intent, must resync.
         assert!(skip_check_mode("symlink", SyncMode::Copy).is_none());
+        assert!(skip_check_mode("junction", SyncMode::Copy).is_none());
     }
 
     #[test]
     fn unknown_existing_mode_is_incompatible() {
         assert!(skip_check_mode("garbage", SyncMode::Symlink).is_none());
+        assert!(skip_check_mode("garbage", SyncMode::Junction).is_none());
         assert!(skip_check_mode("", SyncMode::Copy).is_none());
     }
 }

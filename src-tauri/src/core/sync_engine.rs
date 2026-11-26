@@ -134,9 +134,9 @@ impl ReplacePolicy<'_> {
             TargetState::ForeignLink => match self {
                 ReplacePolicy::NoClobber => false,
                 // Our own link can dangle after the library moves, so a
-                // symlink row still authorizes replacing a link. A copy row
-                // does not: something turned our directory into a link.
-                ReplacePolicy::Recorded { mode } => *mode == "symlink",
+                // symlink or junction row still authorizes replacing a link.
+                // A copy row does not: something turned our directory into a link.
+                ReplacePolicy::Recorded { mode } => SyncMode::is_link(mode),
                 ReplacePolicy::UserConfirmed => true,
             },
             TargetState::RealDir => match self {
@@ -260,6 +260,7 @@ pub fn classify_target(target: &Path, source: Option<&Path>) -> Result<TargetSta
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {
     Symlink,
+    Junction,
     Copy,
 }
 
@@ -267,8 +268,14 @@ impl SyncMode {
     pub fn as_str(&self) -> &'static str {
         match self {
             SyncMode::Symlink => "symlink",
+            SyncMode::Junction => "junction",
             SyncMode::Copy => "copy",
         }
+    }
+
+    /// Whether a recorded mode string represents a link (symlink or directory junction).
+    pub fn is_link(mode: &str) -> bool {
+        matches!(mode, "symlink" | "junction")
     }
 }
 
@@ -276,6 +283,7 @@ impl SyncMode {
 pub fn configured_sync_mode(configured_mode: Option<&str>) -> SyncMode {
     match configured_mode {
         Some("copy") => SyncMode::Copy,
+        Some("junction") => SyncMode::Junction,
         Some("symlink") => SyncMode::Symlink,
         _ => SyncMode::Symlink,
     }
@@ -368,10 +376,9 @@ pub fn sync_skill(
                         // cannot point at remote/UNC paths (e.g. \\wsl.localhost),
                         // which is where the copy fallback still applies.
                         //
-                        // A junction is reported back as `SyncMode::Symlink`:
-                        // std treats mount points as symlinks (`is_symlink()`,
-                        // `read_link`), so freshness checks and removal handle
-                        // it exactly like a real directory symlink.
+                        // A junction is reported back as `SyncMode::Junction` so
+                        // records reflect what is actually on disk while `skip_check_mode`
+                        // still treats it as a valid fallback for `SyncMode::Symlink`.
                         match junction::create(source, target) {
                             Ok(()) => {
                                 log::info!(
@@ -379,7 +386,7 @@ pub fn sync_skill(
                                     target,
                                     source
                                 );
-                                Ok(SyncMode::Symlink)
+                                Ok(SyncMode::Junction)
                             }
                             Err(junction_err) => {
                                 log::warn!(
@@ -400,6 +407,45 @@ pub fn sync_skill(
                 Ok(SyncMode::Copy)
             }
         }
+        SyncMode::Junction => {
+            #[cfg(windows)]
+            {
+                match junction::create(source, target) {
+                    Ok(()) => Ok(SyncMode::Junction),
+                    Err(err) => {
+                        // Junctions cannot point at remote/UNC paths (e.g. \\wsl.localhost)
+                        // or non-NTFS volumes; fall back to copy in that case.
+                        log::warn!(
+                            "junction {:?} -> {:?} failed ({err}), falling back to copy",
+                            target,
+                            source
+                        );
+                        copy_dir_recursive(source, target)?;
+                        Ok(SyncMode::Copy)
+                    }
+                }
+            }
+            #[cfg(unix)]
+            {
+                // Directory junctions are a Windows NTFS feature; on Unix, a
+                // symbolic link is the native directory link and needs no
+                // elevated privileges.
+                log::info!(
+                    "Directory junction is Windows-only; creating symlink {:?} -> {:?} instead",
+                    target,
+                    source
+                );
+                std::os::unix::fs::symlink(source, target).with_context(|| {
+                    format!("Failed to create symlink {:?} -> {:?}", target, source)
+                })?;
+                Ok(SyncMode::Symlink)
+            }
+            #[cfg(all(not(unix), not(windows)))]
+            {
+                copy_dir_recursive(source, target)?;
+                Ok(SyncMode::Copy)
+            }
+        }
         SyncMode::Copy => {
             copy_dir_recursive(source, target)?;
             Ok(SyncMode::Copy)
@@ -407,9 +453,26 @@ pub fn sync_skill(
     }
 }
 
+/// Whether `path` is a Windows NTFS directory junction (reparse mount point).
+/// Always returns `false` on non-Windows platforms.
+pub(crate) fn is_junction(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        junction::exists(path).unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 /// Decide whether the existing target is already in the desired state.
 ///
-/// - **Symlink mode**: the target must be a symlink pointing at `source`.
+/// - **Symlink mode**: the target must be a symlink (not a Windows junction)
+///   pointing at `source`.
+/// - **Junction mode**: on Windows, the target must be a directory junction
+///   pointing at `source`; on Unix, a symlink pointing at `source`.
 /// - **Copy mode**: the target must still exist on disk **and** the
 ///   previously synced source hash must equal the current source hash
 ///   (both must be `Some`). The existence check protects against a
@@ -426,7 +489,17 @@ pub fn is_target_current(
     current_source_hash: Option<&str>,
 ) -> bool {
     match mode {
-        SyncMode::Symlink => symlink_points_to(target, source),
+        SyncMode::Symlink => symlink_points_to(target, source) && !is_junction(target),
+        SyncMode::Junction => {
+            #[cfg(windows)]
+            {
+                is_junction(target) && symlink_points_to(target, source)
+            }
+            #[cfg(not(windows))]
+            {
+                symlink_points_to(target, source)
+            }
+        }
         SyncMode::Copy => match (last_synced_source_hash, current_source_hash) {
             (Some(stored), Some(current)) if stored == current => {
                 std::fs::symlink_metadata(target).is_ok()
@@ -694,6 +767,14 @@ mod tests {
     }
 
     #[test]
+    fn sync_mode_explicit_junction_overrides_default() {
+        assert!(matches!(
+            sync_mode_for_tool("claude-code", Some("junction")),
+            SyncMode::Junction
+        ));
+    }
+
+    #[test]
     fn sync_mode_unknown_config_falls_back_to_tool_default() {
         assert!(matches!(
             sync_mode_for_tool("cursor", Some("invalid")),
@@ -709,19 +790,25 @@ mod tests {
     /// agents, and Antigravity elsewhere, follow the setting.
     #[test]
     fn antigravity_gets_copies_on_windows_only() {
-        for configured in [None, Some("symlink"), Some("copy")] {
+        for configured in [None, Some("symlink"), Some("junction"), Some("copy")] {
             assert_eq!(sync_mode_for_tool_on("antigravity", configured, true), SyncMode::Copy);
         }
         assert_eq!(sync_mode_for_tool_on("antigravity", None, false), SyncMode::Symlink);
+        assert_eq!(sync_mode_for_tool_on("antigravity", Some("junction"), false), SyncMode::Junction);
         assert_eq!(sync_mode_for_tool_on("antigravity", Some("copy"), false), SyncMode::Copy);
         assert_eq!(sync_mode_for_tool_on("cursor", None, true), SyncMode::Symlink);
+        assert_eq!(sync_mode_for_tool_on("cursor", Some("junction"), true), SyncMode::Junction);
         assert_eq!(sync_mode_for_tool_on("cursor", Some("copy"), true), SyncMode::Copy);
     }
 
     #[test]
     fn sync_mode_as_str() {
         assert_eq!(SyncMode::Symlink.as_str(), "symlink");
+        assert_eq!(SyncMode::Junction.as_str(), "junction");
         assert_eq!(SyncMode::Copy.as_str(), "copy");
+        assert!(SyncMode::is_link("symlink"));
+        assert!(SyncMode::is_link("junction"));
+        assert!(!SyncMode::is_link("copy"));
     }
 
     #[test]
@@ -766,6 +853,21 @@ mod tests {
         assert!(tgt.is_symlink());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn sync_skill_junction_falls_back_to_symlink_on_unix() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("source");
+        let tgt = tmp.path().join("target");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("SKILL.md"), "# hello").unwrap();
+
+        let mode = sync_skill(&src, &tgt, SyncMode::Junction, ReplacePolicy::NoClobber).unwrap();
+        assert!(matches!(mode, SyncMode::Symlink));
+        assert!(tgt.is_symlink());
+        assert!(is_target_current(&src, &tgt, SyncMode::Junction, None, None));
+    }
+
     #[cfg(windows)]
     #[test]
     fn sync_skill_symlink_creates_symlink_on_windows() {
@@ -776,8 +878,25 @@ mod tests {
         fs::write(src.join("SKILL.md"), "# hello").unwrap();
 
         let mode = sync_skill(&src, &tgt, SyncMode::Symlink, ReplacePolicy::NoClobber).unwrap();
-        assert!(matches!(mode, SyncMode::Symlink));
+        assert!(matches!(mode, SyncMode::Symlink | SyncMode::Junction));
         assert!(tgt.is_symlink());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sync_skill_junction_creates_junction_on_windows() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("source");
+        let tgt = tmp.path().join("target");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("SKILL.md"), "# hello").unwrap();
+
+        let mode = sync_skill(&src, &tgt, SyncMode::Junction, ReplacePolicy::NoClobber).unwrap();
+        assert!(matches!(mode, SyncMode::Junction));
+        assert!(is_junction(&tgt));
+        assert!(tgt.join("SKILL.md").exists());
+        assert!(is_target_current(&src, &tgt, SyncMode::Junction, None, None));
+        assert!(!is_target_current(&src, &tgt, SyncMode::Symlink, None, None));
     }
 
     #[cfg(windows)]
@@ -790,14 +909,15 @@ mod tests {
         fs::write(src.join("SKILL.md"), "# hello").unwrap();
         junction::create(&src, &tgt).unwrap();
 
-        // A junction must satisfy the symlink-mode freshness check so
+        // A junction must satisfy the junction-mode freshness check so
         // later syncs skip instead of re-creating it on every startup.
-        assert!(is_target_current(&src, &tgt, SyncMode::Symlink, None, None));
+        assert!(is_target_current(&src, &tgt, SyncMode::Junction, None, None));
+        assert!(!is_target_current(&src, &tgt, SyncMode::Symlink, None, None));
         assert!(tgt.join("SKILL.md").exists());
 
-        // And sync_skill must treat it as already current.
-        let mode = sync_skill(&src, &tgt, SyncMode::Symlink, ReplacePolicy::NoClobber).unwrap();
-        assert!(matches!(mode, SyncMode::Symlink));
+        // And sync_skill in Junction mode must treat it as already current.
+        let mode = sync_skill(&src, &tgt, SyncMode::Junction, ReplacePolicy::NoClobber).unwrap();
+        assert!(matches!(mode, SyncMode::Junction));
 
         remove_target(&tgt).unwrap();
         assert!(fs::symlink_metadata(&tgt).is_err());
@@ -828,33 +948,38 @@ mod tests {
         use TargetState::*;
         let copy = ReplacePolicy::Recorded { mode: "copy" };
         let link = ReplacePolicy::Recorded { mode: "symlink" };
+        let junc = ReplacePolicy::Recorded { mode: "junction" };
 
         for state in [Absent, LinkToSource] {
             // Nothing of the user's exists at the target either way.
             assert!(ReplacePolicy::NoClobber.permits(state), "{state:?}");
             assert!(copy.permits(state), "{state:?}");
             assert!(link.permits(state), "{state:?}");
+            assert!(junc.permits(state), "{state:?}");
             assert!(ReplacePolicy::UserConfirmed.permits(state), "{state:?}");
         }
 
-        // A foreign or dangling link is user configuration; only a symlink
-        // record (ours, possibly dangling after a library move) or explicit
-        // intent may replace it.
+        // A foreign or dangling link is user configuration; only a symlink or
+        // junction record (ours, possibly dangling after a library move) or
+        // explicit intent may replace it.
         assert!(!ReplacePolicy::NoClobber.permits(ForeignLink));
         assert!(!copy.permits(ForeignLink));
         assert!(link.permits(ForeignLink));
+        assert!(junc.permits(ForeignLink));
         assert!(ReplacePolicy::UserConfirmed.permits(ForeignLink));
 
         // A real directory is only ever ours under a copy record.
         assert!(!ReplacePolicy::NoClobber.permits(RealDir));
         assert!(copy.permits(RealDir));
         assert!(!link.permits(RealDir));
+        assert!(!junc.permits(RealDir));
         assert!(ReplacePolicy::UserConfirmed.permits(RealDir));
 
         // We never deploy a bare file, so no record can vouch for one.
         assert!(!ReplacePolicy::NoClobber.permits(RealFile));
         assert!(!copy.permits(RealFile));
         assert!(!link.permits(RealFile));
+        assert!(!junc.permits(RealFile));
         assert!(ReplacePolicy::UserConfirmed.permits(RealFile));
     }
 

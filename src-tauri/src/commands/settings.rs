@@ -642,9 +642,13 @@ mod tests {
 
     #[test]
     fn sync_mode_switch_needs_a_changed_sync_mode() {
+        assert!(sync_mode_switched("sync_mode", Some("symlink"), "junction"));
+        assert!(sync_mode_switched("sync_mode", Some("junction"), "copy"));
         assert!(sync_mode_switched("sync_mode", Some("symlink"), "copy"));
         assert!(sync_mode_switched("sync_mode", None, "copy"));
+        assert!(sync_mode_switched("sync_mode", None, "junction"));
         assert!(!sync_mode_switched("sync_mode", Some("copy"), "copy"));
+        assert!(!sync_mode_switched("sync_mode", Some("junction"), "junction"));
         assert!(!sync_mode_switched("proxy_url", Some("a"), "b"));
         assert!(!sync_mode_switched("proxy_url", None, "b"));
     }
